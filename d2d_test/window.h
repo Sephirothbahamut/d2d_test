@@ -13,12 +13,14 @@ namespace d2d
 		friend class frame;
 
 		public:
+			using on_draw_signature = void(window&, const d2d::device_context&);
+
 			struct create_info
 				{
-				d3d11::device & d3d_device;
-				dxgi ::device & dxgi_device;
-				d2d  ::context& d2d_context;
-				std::function<void(window&)> on_render;
+				const d3d ::device& d3d_device;
+				const d2d ::device& d2d_device;
+				const dxgi::device& dxgi_device;
+				std ::function<on_draw_signature> on_render;
 				};
 
 			window(utils::win32::window::base& base, create_info create_info) :
@@ -27,27 +29,25 @@ namespace d2d
 					base,
 					[this](UINT msg, WPARAM wparam, LPARAM lparam) -> std::optional<LRESULT> { return procedure(msg, wparam, lparam); }
 					},
+				on_render{create_info.on_render},
+				d2d_device_context{create_info.d2d_device},
 				dxgi_swapchain{create_info.dxgi_device, get_base().get_handle()},
-				target{create_info.d2d_context, dxgi_swapchain},
-				on_render     {create_info.on_render},
-				dxgi_device_ptr{&create_info.dxgi_device}
+				d2d_bitmap_target{d2d_device_context, dxgi_swapchain}
 				{
+				d2d_device_context->SetTarget(d2d_bitmap_target.get());
 				}
 
-			std::function<void(window&)> on_render;
-
-			const d2d::bitmap& get_render_target() const noexcept { return target; }
-			      d2d::bitmap& get_render_target()       noexcept { return target; }
+			std::function<on_draw_signature> on_render;
 
 			void present() noexcept 
 				{
-				dxgi_swapchain->Present(1, 0);
+				dxgi_swapchain.present();
 				}
 
 		private:
+			d2d::device_context d2d_device_context;
 			dxgi::swap_chain dxgi_swapchain;
-			d2d::bitmap target;
-			utils::observer_ptr<dxgi::device> dxgi_device_ptr;
+			d2d::bitmap d2d_bitmap_target;
 
 
 			std::optional<LRESULT> procedure(UINT msg, WPARAM wparam, LPARAM lparam)
@@ -65,7 +65,7 @@ namespace d2d
 					case WM_PAINT:
 						if (on_render)
 							{
-							on_render(*this);
+							on_render(*this, d2d_device_context);
 							ValidateRect(get_base().get_handle(), NULL);
 							return 0;
 							}
@@ -80,7 +80,11 @@ namespace d2d
 				{
 				if (dxgi_swapchain.get() == nullptr)
 					{
-					dxgi_swapchain.recreate(size, *dxgi_device_ptr, get_base().get_handle());
+					d2d_device_context->SetTarget(nullptr);
+					dxgi_swapchain.resize(size);
+					d2d_bitmap_target = d2d::bitmap{d2d_device_context, dxgi_swapchain};
+					d2d_device_context->SetTarget(d2d_bitmap_target.get());
+					dxgi_swapchain.present();
 					}
 				}
 		};

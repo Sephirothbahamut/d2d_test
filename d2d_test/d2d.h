@@ -19,6 +19,7 @@
 #include <dwrite_3.h>
 #include <wincodec.h>
 #include <DirectXMath.h>
+#include <wrl/client.h>
 
 #include <utils/memory.h>
 
@@ -33,84 +34,89 @@
 
 namespace details
 	{
+	inline constexpr bool enable_debug_layer = utils::compilation::debug;
+	template <typename T>
+	using comptr = Microsoft::WRL::ComPtr<T>;
+	bool succeeded(HRESULT result) { return SUCCEEDED(result); }
+	bool failed   (HRESULT result) { return FAILED   (result); }
+
 	inline std::string hr_to_string(HRESULT hr) noexcept { std::stringstream ss; ss << std::hex << hr; return ss.str(); }
 
-	inline void throw_if_failed(HRESULT hr, const std::string& message)
-		{
-		if (FAILED(hr))
-			{
-			std::cout << message << "\nError code : " << hr_to_string(hr) << std::endl;
-			throw std::runtime_error{message + "\nError code : " + hr_to_string(hr)};
-			}
-		}
 	inline void throw_if_failed(HRESULT hr)
 		{
-		if (FAILED(hr))
+		if (failed(hr))
 			{
-			std::cout << "Error code : " << hr_to_string(hr) << std::endl;
 			throw std::runtime_error{"Error code : " + hr_to_string(hr)};
 			}
 		}
-	
-	
+
 	template <typename T>
-	class wrapper : utils::oop::non_copyable
+	class wrapper : public comptr<T>
 		{
 		public:
 			using value_type = T;
 			using pointer = utils::observer_ptr<value_type>;
-			
-			wrapper(pointer ptr) : ptr{ptr} {}
 
-			const pointer operator->() const noexcept { return ptr; }
-			      pointer operator->()       noexcept { return ptr; }
-			const pointer get       () const noexcept { return ptr; }
-			      pointer get       ()       noexcept { return ptr; }
+			wrapper(const comptr<T>& ptr) : comptr<T>{ptr} { assert(ptr != nullptr); }
+
+			const pointer operator->() const noexcept { return comptr<T>::operator->(); }
+			      pointer operator->()       noexcept { return comptr<T>::operator->(); }
+			const pointer get       () const noexcept { return comptr<T>::Get       (); }
+			      pointer get       ()       noexcept { return comptr<T>::Get       (); }
 
 		protected:
-			pointer ptr{nullptr};
-		};
-
-	template <typename T>
-	class wrapper_unique : public wrapper<T>
-		{
-		using wrapper_t = wrapper<T>;
-		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-			
-			wrapper_unique(pointer ptr) : wrapper_t{ptr} {}
-
-			~wrapper_unique() 
-				{ 
-				if (wrapper<T>::ptr) 
-					{
-					wrapper<T>::ptr->Release(); 
-					} 
-				else
-					{
-					;
-					}
-				}
+			using wrapper_t = wrapper<T>;
+			using comptr_t  = comptr <T>;
 		};
 	}
 
-namespace d3d11
+namespace co
 	{
-	struct device_creation_return;
-	static device_creation_return create_device();
-	
-	using device   = details::wrapper_unique<ID3D11Device2       >;
-	using context  = details::wrapper_unique<ID3D11DeviceContext3>;
-
-	struct device_creation_return { device device; context context; };
-	inline static device_creation_return create_device()
+	struct initializer
 		{
+		 initializer() { details::throw_if_failed(CoInitialize(nullptr)); } //TODO CoInitializeEx
+		~initializer() { CoUninitialize(); }
+		};
+	}
+namespace d3d
+	{
+	struct create_device_and_context_ret;
+	create_device_and_context_ret create_device_and_context();
+
+	class device : public details::wrapper<ID3D11Device2>
+		{
+		friend create_device_and_context_ret create_device_and_context();
+		device(const details::comptr<ID3D11Device>& base) : wrapper_t{create(base)} {}
+		inline static comptr_t create(const details::comptr<ID3D11Device>& base)
+			{
+			comptr_t ret{nullptr};
+			details::throw_if_failed(base.As(&ret));
+			return ret;
+			}
+		};
+	class context : public details::wrapper<ID3D11DeviceContext3>
+		{
+		friend create_device_and_context_ret create_device_and_context();
+		context(const details::comptr<ID3D11DeviceContext>& base) : wrapper_t{create(base)} {}
+		inline static comptr_t create(const details::comptr<ID3D11DeviceContext>& base)
+			{
+			comptr_t ret{nullptr};
+			details::throw_if_failed(base.As(&ret));
+			return ret;
+			}
+		};
+
+	struct create_device_and_context_ret { device device; context context; };
+	inline create_device_and_context_ret create_device_and_context()
+		{
+		details::comptr<ID3D11Device       > device ;
+		details::comptr<ID3D11DeviceContext> context;
+
 		UINT creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-		if constexpr (utils::compilation::debug)
+		if constexpr (details::enable_debug_layer)
 			{
 			// If the project is in a debug build, enable debugging via SDK Layers with this flag.
-			//creation_flags |= D3D11_CREATE_DEVICE_DEBUG;
+			creation_flags |= D3D11_CREATE_DEVICE_DEBUG;
 			}
 
 		std::array<D3D_FEATURE_LEVEL, 7> feature_levels
@@ -124,40 +130,30 @@ namespace d3d11
 			D3D_FEATURE_LEVEL_9_1
 			};
 
-		utils::observer_ptr<ID3D11Device       > device_raw {nullptr};
-		utils::observer_ptr<ID3D11DeviceContext> context_raw{nullptr};
-
 		D3D_FEATURE_LEVEL feature_level_created;
 
 		std::array<D3D_DRIVER_TYPE, 3> attempts{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_SOFTWARE};
-		HRESULT last;
+		HRESULT last{S_FALSE};
 		for (const auto& attempt : attempts)
 			{
 			last = D3D11CreateDevice
 				(
-				nullptr,                  // specify null to use the default adapter
+				nullptr,                // specify null to use the default adapter
 				attempt,
 				0,
-				creation_flags,           // optionally set debug and Direct2D compatibility flags
-				feature_levels.data(),    // list of feature levels this app can support
-				feature_levels.size(),    // number of possible feature levels
+				creation_flags,         // optionally set debug and Direct2D compatibility flags
+				feature_levels.data(),  // list of feature levels this app can support
+				feature_levels.size(),  // number of possible feature levels
 				D3D11_SDK_VERSION,
-				&device_raw,              // returns the Direct3D device created
-				&feature_level_created,   // returns feature level of device created
-				&context_raw              // returns the device immediate context
+				&device,                // returns the Direct3D device created
+				&feature_level_created, // returns feature level of device created
+				&context                // returns the device immediate context
 				);
-			if (SUCCEEDED(last)) { break; }
+			if (details::succeeded(last)) { break; }
 			}
 		details::throw_if_failed(last);
 
-		utils::observer_ptr<ID3D11Device2       > device2_raw {nullptr};
-		utils::observer_ptr<ID3D11DeviceContext3> context2_raw{nullptr};
-
-		if (FAILED(device_raw ->QueryInterface(&device2_raw ))) { device_raw->Release(); }
-		if (FAILED(context_raw->QueryInterface(&context2_raw))) { device_raw->Release(); context_raw->Release(); }
-
-
-		return {{device2_raw}, {context2_raw}};
+		return {{device}, {context}};
 		}
 	}
 
@@ -165,90 +161,45 @@ namespace dxgi
 	{
 	class device : public details::wrapper<IDXGIDevice3>
 		{
-		using wrapper_t = details::wrapper<IDXGIDevice3>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			device(d3d11::device& d3d_device) : wrapper_t{create(d3d_device)} {}
+			device(const d3d::device& d3d_device) : wrapper_t{create(d3d_device)} {}
 
 		private:
-			inline static pointer create(d3d11::device& d3d_device)
+			comptr_t create(const d3d::device& d3d_device)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(d3d_device->QueryInterface(&ret));
-				ret->SetMaximumFrameLatency(1);//TODO check if necessary
+				comptr_t ret{nullptr};
+				details::throw_if_failed(d3d_device.As(&ret));
 				return ret;
 				}
 		};
 
-	class adapter : public details::wrapper<IDXGIAdapter>
+	class swap_chain : public details::wrapper<IDXGISwapChain1>
 		{
-		using wrapper_t = details::wrapper<IDXGIAdapter>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
+			swap_chain(const dxgi::device& dxgi_device, HWND hwnd) : wrapper_t{create(dxgi_device, hwnd)} {}
 
-			adapter(device& device) : wrapper_t{create(device)} {}
-
-		private:
-			inline static pointer create(device& device)
+			void resize(utils::math::vec2u size)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(device->GetAdapter(&ret));
-				return ret;
+				details::throw_if_failed(get()->ResizeBuffers(2, size.x, size.y, DXGI_FORMAT_B8G8R8A8_UNORM, 0));
 				}
-		};
 
-	class factory : public details::wrapper<IDXGIFactory3>
-		{
-		using wrapper_t = details::wrapper<IDXGIFactory3>;
-		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			factory(adapter& adapter) : wrapper_t{create(adapter)} {}
-
-		private:
-			inline static pointer create(adapter& adapter)
+			void present()
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(adapter->GetParent(IID_PPV_ARGS(&ret)));
-				return ret;
-				}
-		};
-	
-	class swap_chain : public details::wrapper_unique<IDXGISwapChain1>
-		{
-		using wrapper_t = details::wrapper_unique<IDXGISwapChain1>;
-		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			swap_chain(device& dxgi_device, HWND hwnd) : wrapper_t{create(dxgi_device, hwnd)} {}
-
-			void invalidate() noexcept { ptr = nullptr; }
-			void recreate(utils::math::vec2u size, device& dxgi_device, HWND hwnd)
-				{
-				if (ptr)
-					{
-					ptr->ResizeBuffers(2, size.x, size.y, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
-					}
-				else
-					{
-					ptr = create(dxgi_device, hwnd);
-					}
+				details::throw_if_failed(get()->Present(1, 0));
 				}
 
 		private:
-			inline static pointer create(device& dxgi_device, HWND hwnd)
+			inline static comptr_t create(const dxgi::device& dxgi_device, HWND hwnd)
 				{
 				RECT client_rect{0, 0, 0, 0};
-				details::throw_if_failed(GetClientRect(hwnd, &client_rect));
+				GetClientRect(hwnd, &client_rect);
 				utils::math::rect<long> rectl{.ll{client_rect.left}, .up{client_rect.top}, .rr{client_rect.right}, .dw{client_rect.bottom}};
+				
+				details::comptr<IDXGIAdapter> dxgi_adapter;
+				details::throw_if_failed(dxgi_device->GetAdapter(&dxgi_adapter));
 
-				dxgi::adapter dxgi_adapter{dxgi_device};
-				dxgi::factory dxgi_factory{dxgi_adapter};//Raymond's is IDXGIFactory2 not IDXGIFactory3 here
+				details::comptr<IDXGIFactory2> dxgi_factory;
+				details::throw_if_failed(dxgi_adapter->GetParent(IID_PPV_ARGS(&dxgi_factory)));
 
 				DXGI_SWAP_CHAIN_DESC1 desc
 					{
@@ -274,9 +225,11 @@ namespace dxgi
 					.Scaling     {DXGI_MODE_SCALING_CENTERED},
 					};
 
-				pointer ret{nullptr};
+				comptr_t ret{nullptr};
 				details::throw_if_failed(dxgi_factory->CreateSwapChainForHwnd(dxgi_device.get(), hwnd, &desc, &desc_fullscreen, nullptr, &ret));
 
+				// Ensure that DXGI does not queue more than one frame at a time. This both reduces latency and
+				// ensures that the application will only render after each VSync, minimizing power consumption.
 				dxgi_device->SetMaximumFrameLatency(1);
 
 				return ret;
@@ -286,36 +239,33 @@ namespace dxgi
 
 namespace dw
 	{
-	class factory : public details::wrapper_unique<IDWriteFactory2>
+	class factory : public details::wrapper<IDWriteFactory2>
 		{
-		using wrapper_t = details::wrapper_unique<IDWriteFactory2>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			factory(D2D1_FACTORY_TYPE factory_type = D2D1_FACTORY_TYPE_SINGLE_THREADED) : wrapper_t{create(factory_type)} {}
-
+			factory() : wrapper_t{create()} {}
 
 		private:
-			inline static pointer create(D2D1_FACTORY_TYPE factory_type)
+			comptr_t create()
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(ret), reinterpret_cast<IUnknown**>(&ret)));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(DWriteCreateFactory
+					(
+					DWRITE_FACTORY_TYPE_SHARED,
+					__uuidof(value_type),
+					&ret
+					));
 				return ret;
 				}
 		};
-	class text_format : public details::wrapper_unique<IDWriteTextFormat>
-		{
-		using wrapper_t = details::wrapper_unique<IDWriteTextFormat>;
-		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
 
+	class text_format : public details::wrapper<IDWriteTextFormat>
+		{
+		public:
 			enum class alignment_ver { top , center, bottom };
 			enum class alignment_hor { left, center, justified, right  };
-
-			text_format(factory& factory) : wrapper_t{create(factory)} {}
-
+	
+			text_format(dw::factory& dw_factory) : wrapper_t{create(dw_factory)} {}
+	
 			void set_alignment_hor(alignment_hor alignment)
 				{
 				switch (alignment)
@@ -335,15 +285,15 @@ namespace dw
 					case dw::text_format::alignment_ver::bottom   : get()->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT::DWRITE_PARAGRAPH_ALIGNMENT_FAR   ); break;
 					}
 				}
-
+	
 		private:
-			inline static pointer create(factory& factory)
+			inline static pointer create(dw::factory& dw_factory)
 				{
 				static const WCHAR sc_fontName[] = L"Calibri";
 				static const FLOAT sc_fontSize = 50;
-
+	
 				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateTextFormat
+				details::throw_if_failed(dw_factory->CreateTextFormat
 					(
 					sc_fontName,
 					nullptr,
@@ -361,66 +311,51 @@ namespace dw
 
 namespace wic
 	{
-	class factory : public details::wrapper_unique<IWICImagingFactory2>
+	class imaging_factory : public details::wrapper<IWICImagingFactory2>
 		{
-		using wrapper_t = details::wrapper_unique<IWICImagingFactory2>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			factory() : wrapper_t{create()} {}
+			imaging_factory() : wrapper_t{create()} {}
 
 		private:
-			inline static pointer create()
+			inline static comptr_t create()
 				{
-				pointer ret{nullptr};
-
-				details::throw_if_failed(CoInitialize(NULL));
+				comptr_t ret{nullptr};
 				details::throw_if_failed(CoCreateInstance
 					(
 					CLSID_WICImagingFactory2,
 					nullptr,
 					CLSCTX_INPROC_SERVER,
-					IID_IWICImagingFactory,
-					reinterpret_cast<void**>(&ret)
+					IID_PPV_ARGS(&ret)
 					));
 				return ret;
 				}
 		};
 
-	class bitmap : public details::wrapper_unique<IWICBitmap>
+	class bitmap : public details::wrapper<IWICBitmap>
 		{
-		using wrapper_t = details::wrapper_unique<IWICBitmap>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			bitmap(factory& factory, utils::math::vec2u size) : wrapper_t{create(factory, size)} {}
-
+			bitmap(const wic::imaging_factory& wic_imaging_factory, utils::math::vec2u size) : wrapper_t{create(wic_imaging_factory, size)} {}
+	
 		private:
-			inline static pointer create(factory& factory, utils::math::vec2u size)
+			inline static comptr_t create(const wic::imaging_factory& wic_imaging_factory, utils::math::vec2u size)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateBitmap(size.x, size.y, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &ret));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(wic_imaging_factory->CreateBitmap(size.x, size.y, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &ret));
 				return ret;
 				}
 		};
-	
-	class stream : public details::wrapper_unique<IWICStream>
+		
+	class stream : public details::wrapper<IWICStream>
 		{
-		using wrapper_t = details::wrapper_unique<IWICStream>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			stream(factory& factory, const std::filesystem::path& path) : wrapper_t{create(factory, path)} {}
-
+			stream(const wic::imaging_factory& wic_imaging_factory, const std::filesystem::path& path) : wrapper_t{create(wic_imaging_factory, path)} {}
+	
 		private:
-			inline static pointer create(factory& factory, const std::filesystem::path& path)
+			inline static comptr_t create(const wic::imaging_factory& wic_imaging_factory, const std::filesystem::path& path)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateStream(&ret));
-				details::throw_if_failed(ret    ->InitializeFromFilename(path.wstring().c_str(), GENERIC_WRITE));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(wic_imaging_factory->CreateStream(&ret));
+				details::throw_if_failed(ret->InitializeFromFilename(path.wstring().c_str(), GENERIC_WRITE));
 				return ret;
 				}
 		};
@@ -428,112 +363,95 @@ namespace wic
 
 namespace d2d
 	{
-	class factory : public details::wrapper_unique<ID2D1Factory6>
+	class factory : public details::wrapper<ID2D1Factory6>
 		{
-		using wrapper_t = details::wrapper_unique<ID2D1Factory6>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			factory(D2D1_FACTORY_TYPE factory_type = D2D1_FACTORY_TYPE_SINGLE_THREADED) : wrapper_t{create(factory_type)} {}
+			factory() : wrapper_t{create()} {}
 
 		private:
-			inline static pointer create(D2D1_FACTORY_TYPE factory_type)
+			inline static comptr_t create()
 				{
-				D2D1_FACTORY_OPTIONS options{};
-				if constexpr (utils::compilation::debug)
+				D2D1_FACTORY_OPTIONS options
 					{
-					// If the project is in a debug build, enable debugging via SDK Layers with this flag.
-					options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
-					}
+					.debugLevel{details::enable_debug_layer ? D2D1_DEBUG_LEVEL_INFORMATION : D2D1_DEBUG_LEVEL_NONE}
+					};
 
-				pointer ret{nullptr};
-				details::throw_if_failed(D2D1CreateFactory(factory_type, __uuidof(ID2D1Factory6), &options, reinterpret_cast<void**>(&ret)));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(D2D1CreateFactory
+					(
+					D2D1_FACTORY_TYPE_SINGLE_THREADED,
+					__uuidof(value_type),
+					&options,
+					&ret
+					));
 				return ret;
 				}
 		};
 
-	class render_target : public details::wrapper_unique<ID2D1RenderTarget>
+	class device : public details::wrapper<ID2D1Device5>
 		{
-		using wrapper_t = details::wrapper_unique<ID2D1RenderTarget>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			render_target from_bitmap(factory& factory, wic::bitmap& bitmap) { return {factory, bitmap}; }
-
-			render_target(factory& factory, wic::bitmap& bitmap) : wrapper_t{create_from_bitmap(factory, bitmap)} {}
+			device(const d2d::factory& d2d_factory, const dxgi::device& dxgi_device) : wrapper_t{create(d2d_factory, dxgi_device)} {}
 
 		private:
-			inline static pointer create_from_bitmap(factory& factory, wic::bitmap& bitmap)
+			inline static comptr_t create(const d2d::factory& d2d_factory, const dxgi::device& dxgi_device)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateWicBitmapRenderTarget(bitmap.get(), D2D1::RenderTargetProperties(), &ret));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(d2d_factory->CreateDevice(dxgi_device.get(), &ret));
 				return ret;
 				}
 		};
 
-	class device : public details::wrapper_unique<ID2D1Device5>
-		{//https://learn.microsoft.com/en-us/windows/win32/direct2d/devices-and-device-contexts
-		using wrapper_t = details::wrapper_unique<ID2D1Device5>;
+	class device_context : public details::wrapper<ID2D1DeviceContext5>
+		{
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			device(factory& factory, dxgi::device& d3d_device) : wrapper_t{create(factory, d3d_device)} {}
+			device_context(const d2d::device& d2d_device) : wrapper_t{create(d2d_device)} {}
 
 		private:
-			inline static pointer create(factory& factory, dxgi::device& dxgi_device)
+			inline static comptr_t create(const d2d::device& d2d_device)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateDevice(dxgi_device.get(), &ret));
-				return ret;
-				}
-		};
-	class context : public details::wrapper_unique<ID2D1DeviceContext5>
-		{//https://learn.microsoft.com/en-us/windows/win32/direct2d/devices-and-device-contexts
-		using wrapper_t = details::wrapper_unique<ID2D1DeviceContext5>;
-		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			context(device& device) : wrapper_t{create(device)} {}
-
-		private:
-			inline static pointer create(device& device)
-				{
-				pointer ret{nullptr};
-				details::throw_if_failed(device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE , &ret));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &ret));
 				return ret;
 				}
 		};
 
-	class bitmap : public details::wrapper_unique<ID2D1Bitmap1>
-		{//https://learn.microsoft.com/en-us/windows/win32/direct2d/devices-and-device-contexts
-		using wrapper_t = details::wrapper_unique<ID2D1Bitmap1>;
+	class bitmap : public details::wrapper<ID2D1Bitmap1>
+		{
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			bitmap(context& context, utils::math::vec2u size) : wrapper_t{create(context, size)} {}
-			bitmap(context& context) : wrapper_t{create(context)} {}
-			bitmap(context& context, wic::bitmap     & wic_bitmap) : wrapper_t{create_from_wic_bitmap  (context, wic_bitmap)} {}
-			bitmap(context& context, dxgi::swap_chain& swap_chain) : wrapper_t{create_from_dxgi_surface(context, swap_chain)} {}
-
-			inline static bitmap from_wic_bitmap  (context& context, wic::bitmap     & wic_bitmap) { return {context, wic_bitmap}; }
-			inline static bitmap from_dxgi_surface(context& context, dxgi::swap_chain& swap_chain) { return {context, swap_chain}; }
+			bitmap(const d2d::device_context& d2d_device_context, const dxgi::swap_chain& dxgi_swapchain) : wrapper_t{create(d2d_device_context, dxgi_swapchain)} {}
+			bitmap(const d2d::device_context& d2d_device_context, utils::math::vec2u size) : wrapper_t{create(d2d_device_context, size)} {}
+			//bitmap(const d2d::device_context& d2d_device_context, const wic::bitmap& wic_bitmap) : wrapper_t{create_from_wic_bitmap  (context, wic_bitmap)} {}
 
 		private:
-			inline static pointer create(context& context)
+			inline static comptr_t create(const d2d::device_context& d2d_device_context, const dxgi::swap_chain& dxgi_swapchain)
 				{
-				D2D1_SIZE_U pixel_size{context->GetPixelSize()};
-				return create(context, utils::math::vec2u{pixel_size.width, pixel_size.height});
+				details::comptr<IDXGISurface2> dxgi_back_buffer;
+				details::throw_if_failed(dxgi_swapchain->GetBuffer(0, IID_PPV_ARGS(&dxgi_back_buffer)));
+
+				D2D1_BITMAP_PROPERTIES1 properties
+					{
+					.pixelFormat{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
+					.dpiX{1},//TODO dpi stuff
+					.dpiY{1},
+					.bitmapOptions{D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW},
+					};
+
+				comptr_t ret{nullptr};
+				details::throw_if_failed(d2d_device_context->CreateBitmapFromDxgiSurface(dxgi_back_buffer.Get(), &properties, &ret));
+				return ret;
 				}
 
-			inline static pointer create(context& context, utils::math::vec2u size)
+			inline static comptr_t create(const d2d::device_context& d2d_device_context)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(context->CreateBitmap
+				D2D1_SIZE_U pixel_size{d2d_device_context->GetPixelSize()};
+				return create(d2d_device_context, utils::math::vec2u{pixel_size.width, pixel_size.height});
+				}
+			
+			inline static comptr_t create(const d2d::device_context& d2d_device_context, utils::math::vec2u size)
+				{
+				comptr_t ret{nullptr};
+				details::throw_if_failed(d2d_device_context->CreateBitmap
 					(
 					D2D1_SIZE_U{.width{size.x}, .height{size.y}},
 					nullptr, 
@@ -547,102 +465,72 @@ namespace d2d
 					));
 				return ret;
 				}
-
-			inline static pointer create_from_wic_bitmap(context& context, wic::bitmap& wic_bitmap)
-				{
-				pointer ret{nullptr};
-				details::throw_if_failed(context->CreateBitmapFromWicBitmap(wic_bitmap.get(), &ret));
-				return ret;
-				}
-
-			inline static pointer create_from_dxgi_surface(context& context, dxgi::swap_chain& swap_chain)
-				{
-				utils::observer_ptr<IDXGISurface2> dxgi_back_buffer;
-				details::throw_if_failed(swap_chain->GetBuffer(0, IID_PPV_ARGS(&dxgi_back_buffer)));
-
-				D2D1_BITMAP_PROPERTIES1 properties
-					{
-					.pixelFormat{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
-					.dpiX{1},//TODO dpi stuff
-					.dpiY{1},
-					.bitmapOptions{D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW},
-					};
-
-				pointer ret{nullptr};
-				details::throw_if_failed(context->CreateBitmapFromDxgiSurface(dxgi_back_buffer, &properties, &ret));
-				return ret;
-				}
+			
+			//inline static pointer create_from_wic_bitmap(const d2d::device_context& d2d_device_context, const wic::bitmap& wic_bitmap)
+			//	{
+			//	pointer ret{nullptr};
+			//	details::throw_if_failed(d2d_device_context->CreateBitmapFromWicBitmap(wic_bitmap.get(), &ret));
+			//	return ret;
+			//	}
 		};
 	}
 
 namespace wic
 	{
-	class bitmap_encoder : public details::wrapper_unique<IWICBitmapEncoder>
+	class bitmap_encoder : public details::wrapper<IWICBitmapEncoder>
 		{
-		using wrapper_t = details::wrapper_unique<IWICBitmapEncoder>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			bitmap_encoder(factory& factory) : wrapper_t{create(factory)} {}
+			bitmap_encoder(const wic::imaging_factory& wic_factory) : wrapper_t{create(wic_factory)} {}
 
 		private:
-			inline static pointer create(factory& factory)
+			inline static comptr_t create(const wic::imaging_factory& wic_factory)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &ret));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(wic_factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &ret));
 				return ret;
 				}
 
 		public:
-			class frame : public details::wrapper_unique<IWICBitmapFrameEncode>
+			class frame : public details::wrapper<IWICBitmapFrameEncode>
 				{
-				using wrapper_t = details::wrapper_unique<IWICBitmapFrameEncode>;
 				public:
-					using value_type = wrapper_t::value_type;
-					using pointer    = wrapper_t::pointer;
-
-					frame(bitmap_encoder& encoder) : wrapper_t{create(encoder)} {}
+					frame(const bitmap_encoder& encoder) : wrapper_t{create(encoder)} {}
 
 				private:
-					inline static pointer create(bitmap_encoder& encoder)
+					inline static comptr_t create(const bitmap_encoder& encoder)
 						{
-						pointer ret{nullptr};
+						comptr_t ret{nullptr};
 						details::throw_if_failed(encoder->CreateNewFrame(&ret, nullptr));
 						return ret;
 						}
 			};
 		};
 	
-	class image_encoder : public details::wrapper_unique<IWICImageEncoder>
+	class image_encoder : public details::wrapper<IWICImageEncoder>
 		{
-		using wrapper_t = details::wrapper_unique<IWICImageEncoder>;
 		public:
-			using value_type = wrapper_t::value_type;
-			using pointer    = wrapper_t::pointer;
-
-			image_encoder(factory& factory, d2d::device & d2d_device ) : wrapper_t{create(factory, d2d_device )} {}
+			image_encoder(const wic::imaging_factory& wic_factory, const d2d::device& d2d_device ) : wrapper_t{create(wic_factory, d2d_device )} {}
 
 		private:
-			inline static pointer create(factory& factory, d2d::device& d2d_device)
+			inline static comptr_t create(const wic::imaging_factory& wic_factory, const d2d::device& d2d_device)
 				{
-				pointer ret{nullptr};
-				details::throw_if_failed(factory->CreateImageEncoder(d2d_device.get(), &ret));
+				comptr_t ret{nullptr};
+				details::throw_if_failed(wic_factory->CreateImageEncoder(d2d_device.get(), &ret));
 				return ret;
 				}
 		};
 
-	void save_to_file(factory& factory, d2d::device& d2d_device, d2d::context& d2d_context, d2d::bitmap& d2d_bitmap, const std::filesystem::path& path)
+	void save_to_file(const wic::imaging_factory& wic_factory, const d2d::device& d2d_device, const d2d::bitmap& d2d_bitmap, const std::filesystem::path& path)
 		{// https://github.com/uri247/Win81App/blob/master/Direct2D%20save%20to%20image%20file%20sample/C%2B%2B/SaveAsImageFileSample.cpp
 
-		stream stream{factory, path};
-		bitmap_encoder bitmap_encoder{factory};
+		wic::stream stream{wic_factory, path};
+		wic::bitmap_encoder bitmap_encoder{wic_factory};
 		details::throw_if_failed(bitmap_encoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
 
-		bitmap_encoder::frame frame_encode{bitmap_encoder};
+		wic::bitmap_encoder::frame frame_encode{bitmap_encoder};
 		details::throw_if_failed(frame_encode->Initialize(nullptr));
 
-		image_encoder image_encoder{factory, d2d_device};
+		wic::image_encoder image_encoder{wic_factory, d2d_device};
 
 		details::throw_if_failed(image_encoder->WriteFrame(d2d_bitmap.get(), frame_encode.get(), nullptr));
 		details::throw_if_failed(frame_encode->Commit());
